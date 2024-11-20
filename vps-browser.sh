@@ -112,7 +112,6 @@ EOL
         -v /etc/localtime:/etc/localtime:ro \
         -p 3000:3000 \
         -p 3001:3001 \
-        --shm-size="2gb" \
         --security-opt seccomp=unconfined \
         --restart unless-stopped \
         lscr.io/linuxserver/chromium:latest
