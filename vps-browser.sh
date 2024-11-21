@@ -25,8 +25,46 @@ get_proxy() {
 }
 
 install_browser() {
-    local container_name=$1
-    local proxy_url=$2
+    show "green" "Введите имя для браузера (или нажмите Enter для автоматического имени):"
+    read -p "> " custom_name
+    
+    local container_name
+    if [ -z "$custom_name" ]; then
+        container_name="browser-$(date +%s)"
+    else
+        # Проверка корректности имени
+        if ! [[ $custom_name =~ ^[a-zA-Z0-9-]+$ ]]; then
+            show "red" "⚠ Некорректное имя! Используйте только буквы, цифры и дефис."
+            return 1
+        fi
+        # Проверка существования браузера с таким именем
+        if docker ps -a | grep -q " $custom_name$"; then
+            show "red" "⚠ Браузер с таким именем уже существует!"
+            return 1
+        fi
+        container_name=$custom_name
+    fi
+    
+    # Улучшенная функция поиска свободных портов
+    find_free_ports() {
+        local port=3000
+        while true; do
+            if ! sudo lsof -i ":$port" >/dev/null 2>&1 && ! sudo lsof -i ":$((port+1))" >/dev/null 2>&1; then
+                if ! docker ps -a | grep -q ":$port->" && ! docker ps -a | grep -q ":$((port+1))->"; then
+                    echo "$port"
+                    return
+                fi
+            fi
+            port=$((port + 2))
+        done
+    }
+
+    # Находим свободные порты
+    local base_port=$(find_free_ports)
+    local http_port=$base_port
+    local https_port=$((base_port + 1))
+    
+    show "cyan" "Выбраны порты: HTTP=$http_port, HTTPS=$https_port"
     
     USERNAME=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 5; echo)
     PASSWORD=$(< /dev/urandom tr -dc 'A-Za-z0-9@#$&' | head -c 10; echo)
@@ -93,7 +131,8 @@ EOL
 EOL
     fi
     
-    sudo docker run -d \
+    # Добавим проверку успешности запуска контейнера
+    if ! sudo docker run -d \
         --name $container_name \
         -e TITLE=$container_name \
         -e DISPLAY=:1 \
@@ -110,14 +149,19 @@ EOL
         -v "$HOME/chromium/$container_name/config:/config" \
         -v /dev/shm:/dev/shm \
         -v /etc/localtime:/etc/localtime:ro \
-        -p 3000:3000 \
-        -p 3001:3001 \
+        -p $http_port:3000 \
+        -p $https_port:3001 \
         --security-opt seccomp=unconfined \
         --restart unless-stopped \
-        lscr.io/linuxserver/chromium:latest
+        lscr.io/linuxserver/chromium:latest; then
         
-    show "green" "Браузер установлен!"
-    show "cyan" "Доступ: http://$IP:3000/ или https://$IP:3001/"
+        show "red" "❌ Ошибка при создании контейнера!"
+        show "red" "Попробуйте удалить неиспользуемые контейнеры или использовать другие порты."
+        return 1
+    fi
+        
+    show "green" "✅ Браузер успешно установлен!"
+    show "cyan" "Доступ: http://$IP:$http_port/ или https://$IP:$https_port/"
     show "cyan" "Имя пользователя: $USERNAME"
     show "cyan" "Пароль: $PASSWORD"
     show "cyan" "Учетные данные сохранены в $CREDENTIALS_FILE"
@@ -244,8 +288,10 @@ restart_browser() {
         credentials_file="$HOME/vps-browser-credentials-$browser_name.json"
         if [ -f "$credentials_file" ]; then
             IP=$(curl -s ifconfig.me)
+            http_port=$(docker port $browser_name 3000 2>/dev/null | cut -d ':' -f2)
+            https_port=$(docker port $browser_name 3001 2>/dev/null | cut -d ':' -f2)
             show "cyan" "Данные для входа:"
-            show "cyan" "URL: http://$IP:3000/ или https://$IP:3001/"
+            show "cyan" "URL: http://$IP:$http_port/ или https://$IP:$https_port/"
             show "cyan" "Учетные данные сохранены в $credentials_file"
         fi
     else
@@ -307,10 +353,14 @@ view_browsers() {
         status=$(docker ps -f "name=${browsers[$i]}" --format "{{.Status}}" | grep -q "Up" && echo "🟢 Работает" || echo "🔴 Остановлен")
         credentials_file="$HOME/vps-browser-credentials-${browsers[$i]}.json"
         
+        # Получаем порты для каждого контейнера
+        http_port=$(docker port ${browsers[$i]} 3000 2>/dev/null | cut -d ':' -f2)
+        https_port=$(docker port ${browsers[$i]} 3001 2>/dev/null | cut -d ':' -f2)
+        
         show "yellow" "╔═══ Браузер #$((i+1)) ═══╗"
         show "cyan" "Имя: ${browsers[$i]}"
         show "cyan" "Статус: $status"
-        show "cyan" "URL: http://$IP:3000/ или https://$IP:3001/"
+        show "cyan" "URL: http://$IP:$http_port/ или https://$IP:$https_port/"
         
         if [ -f "$credentials_file" ]; then
             show "green" "=== Учетные данные ==="
@@ -328,6 +378,71 @@ view_browsers() {
     done
 }
 
+# Добавляем новую функцию для изменения имени браузера
+rename_browser() {
+    show "yellow" "╔═══ Список установленных браузеров ═══╗"
+    
+    browsers=($(docker ps -a --filter "ancestor=lscr.io/linuxserver/chromium" --format "{{.Names}}"))
+    
+    if [ ${#browsers[@]} -eq 0 ]; then
+        show "red" "Установленных браузеров не найдено!"
+        return
+    fi
+    
+    for i in "${!browsers[@]}"; do
+        status=$(docker ps -f "name=${browsers[$i]}" --format "{{.Status}}" | grep -q "Up" && echo "🟢 Работает" || echo "🔴 Остановлен")
+        show "cyan" "[$((i+1))] ${browsers[$i]} - $status"
+    done
+    
+    echo
+    show "green" "Введите номер браузера для переименования (или 'q' для отмены):"
+    read -p "> " choice
+    
+    if [[ "$choice" == "q" ]]; then
+        show "yellow" "Операция отменена"
+        return
+    fi
+    
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#browsers[@]} ]; then
+        show "red" "⚠ Неверный выбор!"
+        return
+    fi
+    
+    old_name=${browsers[$((choice-1))]}
+    show "green" "Введите новое имя для браузера (только буквы, цифры и дефис):"
+    read -p "> " new_name
+    
+    # Проверка корректности нового имени
+    if ! [[ $new_name =~ ^[a-zA-Z0-9-]+$ ]]; then
+        show "red" "⚠ Некорректное имя! Используйте только буквы, цифры и дефис."
+        return
+    fi
+    
+    # Проверка существования браузера с таким именем
+    if docker ps -a | grep -q " $new_name$"; then
+        show "red" "⚠ Браузер с таким именем уже существует!"
+        return
+    fi
+    
+    # Переименование контейнера
+    if sudo docker rename $old_name $new_name; then
+        # Обновляем файл с учетными данными
+        if [ -f "$HOME/vps-browser-credentials-$old_name.json" ]; then
+            mv "$HOME/vps-browser-credentials-$old_name.json" "$HOME/vps-browser-credentials-$new_name.json"
+            sed -i "s/\"browser\": \"$old_name\"/\"browser\": \"$new_name\"/" "$HOME/vps-browser-credentials-$new_name.json"
+        fi
+        
+        # Обновляем папку с конфигурацией
+        if [ -d "$HOME/chromium/$old_name" ]; then
+            mv "$HOME/chromium/$old_name" "$HOME/chromium/$new_name"
+        fi
+        
+        show "green" "✓ Браузер успешно переименован из $old_name в $new_name"
+    else
+        show "red" "✗ Ошибка при переименовании браузера"
+    fi
+}
+
 main_menu() {
     while true; do
         clear
@@ -335,10 +450,10 @@ main_menu() {
         echo -e "\033[1;34m|\033[0m     \033[1;33mУправление браузером VPS\033[0m    \033[1;34m|\033[0m"
         echo -e "\033[1;34m+-----------------------------------+\033[0m"
         echo -e "\033[1;34m|\033[0m \033[1;32m1.\033[0m Установить браузер               \033[1;34m|\033[0m"
-        echo -e "\033[1;34m|\033[0m \033[1;32m2.\033[0m Установить браузер с прокси      \033[1;34m|\033[0m"
-        echo -e "\033[1;34m|\033[0m \033[1;32m3.\033[0m Просмотр установленных браузеров \033[1;34m|\033[0m"
-        echo -e "\033[1;34m|\033[0m \033[1;32m4.\033[0m Перезапустить браузер            \033[1;34m|\033[0m"
-        echo -e "\033[1;34m|\033[0m \033[1;32m5.\033[0m Просмотр огов браузера          \033[1;34m|\033[0m"
+        echo -e "\033[1;34m|\033[0m \033[1;32m2.\033[0m Просмотр установленных браузеров \033[1;34m|\033[0m"
+        echo -e "\033[1;34m|\033[0m \033[1;32m3.\033[0m Перезапустить браузер            \033[1;34m|\033[0m"
+        echo -e "\033[1;34m|\033[0m \033[1;32m4.\033[0m Просмотр логов браузера          \033[1;34m|\033[0m"
+        echo -e "\033[1;34m|\033[0m \033[1;32m5.\033[0m Переименовать браузер            \033[1;34m|\033[0m"
         echo -e "\033[1;34m|\033[0m \033[1;32m6.\033[0m Удалить браузер                  \033[1;34m|\033[0m"
         echo -e "\033[1;34m|\033[0m \033[1;31m7.\033[0m Выход                            \033[1;34m|\033[0m"
         echo -e "\033[1;34m+-----------------------------------+\033[0m"
@@ -351,37 +466,35 @@ main_menu() {
                 clear
                 show "yellow" "╔═══ Установка браузера ═══╗"
                 check_requirements
-                install_browser "browser" ""
+                install_browser "browser-$(date +%s)"
                 show "cyan" "Нажмите Enter для продолжения..."
                 read
                 ;;
             2)
                 clear
-                show "yellow" "╔═══ Установка браузера с прокси ═══╗"
-                proxy_url=$(get_proxy)
-                check_requirements
-                install_browser "browser-proxy" "$proxy_url"
+                show "yellow" "╔═══ Просмотр браузеров ═══╗"
+                view_browsers
                 show "cyan" "Нажмите Enter для продолжения..."
                 read
                 ;;
             3)
-                clear
-                show "yellow" "╔═══ Просмотр браузеров ═══╗"
-                view_browsers
-                show "cyan" "Нажмите Enter для продолженя..."
-                read
-                ;;
-            4)
                 clear
                 show "yellow" "╔═══ Перезапуск браузера ═══╗"
                 restart_browser
                 show "cyan" "Нажмите Enter для продолжения..."
                 read
                 ;;
-            5)
+            4)
                 clear
                 show "yellow" "╔═══ Просмотр логов ═══╗"
                 view_logs
+                show "cyan" "Нажмите Enter для продолжения..."
+                read
+                ;;
+            5)
+                clear
+                show "yellow" "╔═══ Переименование браузера ═══╗"
+                rename_browser
                 show "cyan" "Нажмите Enter для продолжения..."
                 read
                 ;;
